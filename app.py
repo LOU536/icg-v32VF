@@ -7,6 +7,10 @@ from data_sources import load_base
 
 st.set_page_config(
     page_title="ICG v3.2",
+    st.info(
+    "Fuentes activas: Banco Mundial + fallback local + señales regulatorias. "
+    "Los datos estructurales usan el último dato disponible; los shocks pueden actualizarse en tiempo real."
+)
     page_icon="🌍",
     layout="wide",
     initial_sidebar_state="expanded",
