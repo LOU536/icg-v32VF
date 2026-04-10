@@ -47,3 +47,11 @@ Crea `.streamlit/secrets.toml` a partir del ejemplo si quieres activar noticias.
 ## Nota metodológica
 
 Esta versión es **híbrida** a propósito. No fuerza una falsa precisión para variables estratégicas donde no hay todavía una API oficial única, limpia y homogénea.
+## Roadmap v3.3
+
+- [ ] Añadir arquitectura hot / warm / cold
+- [ ] Mostrar fecha/frescura de cada fuente
+- [ ] Integrar NewsAPI real
+- [ ] Añadir score de shocks recientes
+- [ ] Preparar integración de comercio reciente
+- [ ] Mejorar diseño visual
