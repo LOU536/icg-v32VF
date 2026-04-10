@@ -1,193 +1,263 @@
-from __future__ import annotations
-
-import os
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 
-from data_sources import (
-    compute_news_shock,
-    enrich_with_world_bank,
-    fetch_newsapi_articles,
-    load_regulatory_signals,
-)
-from scoring import THEME_WEIGHTS, compute_scores
-from visuals import choropleth, matrix_power_access, radar_compare, ranking_bar, signal_gap_chart
+from data_sources import load_base
 
 st.set_page_config(
-    page_title="ICG v3.2 · Real Data Hybrid",
-    page_icon="🌐",
+    page_title="ICG v3.2",
+    page_icon="🌍",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 1.1rem; padding-bottom: 1.1rem;}
-    html, body, [class*="css"] {background-color:#08111f; color:#d6e2f0;}
-    [data-testid="stSidebar"] {background-color:#06101c; border-right:1px solid #16314d;}
-    .hero {background: linear-gradient(135deg,#0b1a2d 0%,#0c2138 55%,#091423 100%); border:1px solid #1d3e62; border-radius:18px; padding:22px 26px; margin-bottom:18px;}
-    .hero h1 {margin:0; font-size:2rem; color:#eef6ff;}
-    .hero p {color:#8da8c4; margin:8px 0 0 0;}
-    .tag {display:inline-block; padding:4px 8px; border-radius:999px; border:1px solid #2c567f; color:#6ec1ff; font-size:.75rem; margin-bottom:10px;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-THEMES = list(THEME_WEIGHTS.keys())
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+def minmax(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    if s.isna().all():
+        return pd.Series([50.0] * len(series), index=series.index)
+    mn = s.min()
+    mx = s.max()
+    if pd.isna(mn) or pd.isna(mx) or mx == mn:
+        return pd.Series([50.0] * len(series), index=series.index)
+    return ((s - mn) / (mx - mn) * 100).clip(0, 100)
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
-def load_base(year: int) -> pd.DataFrame:
-    base = load_regulatory_signals("data/regulatory_signals.csv")
-    return enrich_with_world_bank(base, wb_year=year)
+def build_scores(df: pd.DataFrame, tariff: float, export_controls_shock: float, logistics_shock: float, theme: str) -> pd.DataFrame:
+    out = df.copy()
+
+    # Base hard variables
+    out["gdp_score"] = minmax(out["gdp_usd"])
+    out["reserves_score"] = minmax(out["reserves_usd"])
+    out["energy_resilience_score"] = minmax(-pd.to_numeric(out["energy_import_pct"], errors="coerce"))
+
+    # Structural base
+    out["icg_base"] = (
+        out["gdp_score"] * 0.45 +
+        out["reserves_score"] * 0.30 +
+        out["energy_resilience_score"] * 0.25
+    ).round(2)
+
+    # Regulatory friction
+    out["friction_score"] = (
+        out["ntm"] * 0.35 +
+        out["regulation"] * 0.25 +
+        out["export_controls"] * 0.25 +
+        out["industrial_policy"] * 0.15
+    ).round(2)
+
+    # Strategic signal
+    out["signal_score"] = (
+        out["strategic_signal"] * 0.50 +
+        out["think_tank"] * 0.25 +
+        out["capital_confirmation"] * 0.25
+    ).round(2)
+
+    # Theme adjustment
+    theme_boost = pd.Series([1.0] * len(out), index=out.index)
+
+    if theme == "Energy":
+        theme_boost = 1 + (100 - out["energy_resilience_score"]) / 250
+    elif theme == "Regulatory":
+        theme_boost = 1 + out["friction_score"] / 400
+    elif theme == "Capital":
+        theme_boost = 1 + out["capital_confirmation"] / 350
+    elif theme == "Strategy":
+        theme_boost = 1 + out["signal_score"] / 350
+
+    # Shock penalty
+    # Ojo: aquí el shock se trata como penalidad simple y transparente
+    shock_penalty = (
+        tariff * 0.18 +
+        export_controls_shock * 0.22 +
+        logistics_shock * 0.15
+    )
+
+    out["icg_full_raw"] = (
+        out["icg_base"] * 0.55 +
+        out["signal_score"] * 0.30 -
+        out["friction_score"] * 0.15 -
+        shock_penalty
+    ) * theme_boost
+
+    out["icg_full"] = minmax(out["icg_full_raw"]).round(2)
+
+    out["category"] = pd.cut(
+        out["icg_full"],
+        bins=[-1, 20, 40, 60, 80, 101],
+        labels=["Crítico", "Vulnerable", "Intermedio", "Fuerte", "Dominante"]
+    )
+
+    out = out.sort_values("icg_full", ascending=False).reset_index(drop=True)
+    return out
 
 
-def main() -> None:
-    with st.sidebar:
-        st.title("ICG v3.2")
-        st.caption("Hybrid: real World Bank data + curated strategic/regulatory layer")
-        wb_year = st.selectbox("World Bank year", [2023, 2022, 2021], index=0)
-        theme = st.selectbox("Motor temático", THEMES)
+def plot_map(df: pd.DataFrame) -> go.Figure:
+    fig = px.choropleth(
+        df,
+        locations="iso3",
+        color="icg_full",
+        hover_name="country",
+        hover_data={
+            "icg_full": True,
+            "icg_base": True,
+            "signal_score": True,
+            "friction_score": True,
+            "iso3": False,
+        },
+        color_continuous_scale="RdYlGn",
+        title="ICG v3.2 — Global Map",
+    )
+    fig.update_layout(margin=dict(t=60, l=0, r=0, b=0), height=520)
+    return fig
 
-        st.markdown("### Shocks")
-        shock_tariff = st.slider("Arancel EE.UU. (%)", 0, 100, 10, 5)
-        shock_export_controls = st.slider("Escalada export controls", 0, 100, 20, 5)
-        shock_shipping = st.slider("Disrupción shipping/logística", 0, 100, 15, 5)
 
-        st.markdown("### News overlay")
-        default_key = st.secrets.get("NEWS_API_KEY", "") if hasattr(st, "secrets") else ""
-        news_api_key = st.text_input("NewsAPI key", type="password", value=default_key)
-        news_query = st.text_input("Query", value="sanctions OR \"export controls\" OR tariff OR shipping")
-        use_news = st.checkbox("Activar overlay de noticias", value=False)
+def plot_ranking(df: pd.DataFrame) -> go.Figure:
+    dd = df.head(15).sort_values("icg_full", ascending=True)
+    fig = px.bar(
+        dd,
+        x="icg_full",
+        y="country",
+        orientation="h",
+        color="icg_full",
+        color_continuous_scale="RdYlGn",
+        title="Top 15 Ranking",
+    )
+    fig.update_layout(height=560, coloraxis_showscale=False)
+    return fig
 
-    base_df = load_base(wb_year)
 
-    if use_news and news_api_key:
-        with st.spinner("Leyendo noticias..."):
-            articles = fetch_newsapi_articles(news_query, news_api_key, page_size=20)
-            news_df = compute_news_shock(articles, base_df["country"].tolist())
-            model_df = base_df.merge(news_df, on="country", how="left")
-            model_df["news_shock"] = model_df["news_shock"].fillna(0)
-    else:
-        model_df = base_df.copy()
-        model_df["news_shock"] = 0.0
-        articles = []
+def plot_radar(df: pd.DataFrame, country_a: str, country_b: str) -> go.Figure:
+    dims = ["icg_base", "signal_score", "friction_score", "capital_confirmation"]
+    labels = ["Base", "Signal", "Friction", "Capital"]
 
-    df = compute_scores(
-        model_df,
+    da = df[df["country"] == country_a].iloc[0]
+    db = df[df["country"] == country_b].iloc[0]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=[da[d] for d in dims] + [da[dims[0]]],
+        theta=labels + [labels[0]],
+        fill="toself",
+        name=country_a
+    ))
+    fig.add_trace(go.Scatterpolar(
+        r=[db[d] for d in dims] + [db[dims[0]]],
+        theta=labels + [labels[0]],
+        fill="toself",
+        name=country_b
+    ))
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+        showlegend=True,
+        height=500,
+        title=f"Comparación: {country_a} vs {country_b}",
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+def main():
+    st.title("🌍 ICG v3.2")
+    st.caption("Hybrid model with World Bank live data + local fallback + regulatory signals")
+
+    # Sidebar
+    st.sidebar.header("Configuración")
+
+    wb_year = st.sidebar.selectbox(
+        "World Bank year",
+        options=[2023, 2022, 2021, 2020],
+        index=0,
+    )
+
+    theme = st.sidebar.selectbox(
+        "Motor temático",
+        options=["General", "Energy", "Regulatory", "Capital", "Strategy"],
+        index=0,
+    )
+
+    st.sidebar.markdown("### Shocks")
+    tariff = st.sidebar.slider("Arancel EE.UU. (%)", 0, 100, 10)
+    export_controls_shock = st.sidebar.slider("Escalada export controls", 0, 100, 20)
+    logistics_shock = st.sidebar.slider("Disrupción shipping/logística", 0, 100, 15)
+
+    st.sidebar.markdown("### News overlay")
+    st.sidebar.text_input("NewsAPI key", type="password", disabled=True)
+    st.sidebar.text_input("Query", value='sanctions OR "export controls"', disabled=True)
+    st.sidebar.checkbox("Activar overlay de noticias", value=False, disabled=True)
+
+    # Data load with graceful fallback
+    with st.spinner("Cargando datos base..."):
+        try:
+            base_df = load_base(wb_year)
+            st.sidebar.success("Datos cargados")
+        except Exception as e:
+            st.error(f"No se pudieron cargar los datos base: {e}")
+            st.stop()
+
+    df = build_scores(
+        base_df,
+        tariff=tariff,
+        export_controls_shock=export_controls_shock,
+        logistics_shock=logistics_shock,
         theme=theme,
-        shock_tariff=shock_tariff,
-        shock_export_controls=shock_export_controls,
-        shock_shipping=shock_shipping,
     )
 
-    top = df.iloc[0]
-    avg = df["icg_full"].mean()
-    fragile = int((df["icg_full"] < 40).sum())
-
-    st.markdown(
-        f"""
-        <div class="hero">
-            <div class="tag">REAL DATA HYBRID · WORLD BANK + CURATED STRATEGIC LAYER</div>
-            <h1>ICG v3.2 — Geoeconomic Power, Friction & Signal Engine</h1>
-            <p>
-                Combina datos reales del Banco Mundial para PIB, reservas y dependencia energética con una capa curada
-                de fricción regulatoria, señal estratégica, capital y alineamiento geopolítico. Tema activo: <b>{theme}</b>.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
+    # KPIs
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Líder global", top["country"], f"ICG Full {top['icg_full']:.1f}")
-    c2.metric("Promedio", f"{avg:.1f}", f"{len(df)} países")
-    c3.metric("Estados frágiles", fragile, "ICG < 40")
-    c4.metric("Año WB", str(wb_year), "Datos macro reales")
+    c1.metric("Líder", df.iloc[0]["country"])
+    c2.metric("ICG medio", f"{df['icg_full'].mean():.1f}")
+    c3.metric("Estados vulnerables", int((df["icg_full"] < 40).sum()))
+    c4.metric("Tema activo", theme)
 
-    tabs = st.tabs([
-        "🌍 Mapa & ranking",
-        "🧠 Señal estratégica",
-        "🚧 Fricción & acceso",
-        "🎯 Comparación",
-        "📰 News overlay",
-        "📋 Datos",
-    ])
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["🌍 Mapa", "📊 Ranking", "🎯 Comparación", "📋 Tabla"])
 
-    with tabs[0]:
-        left, right = st.columns([1.7, 1.3])
-        with left:
-            metric = st.selectbox(
-                "Métrica del mapa",
-                ["icg_full", "icg_base", "strategic_signal", "regulatory_friction", "capital_confirmation", "market_access_viability"],
-                index=0,
-            )
-            st.plotly_chart(choropleth(df, metric, f"Mapa global — {metric}"), use_container_width=True)
-        with right:
-            st.plotly_chart(ranking_bar(df, "icg_full", "Ranking ICG Full"), use_container_width=True)
+    with tab1:
+        st.plotly_chart(plot_map(df), use_container_width=True)
 
-    with tabs[1]:
-        left, right = st.columns([1.2, 1.8])
-        with left:
-            st.plotly_chart(ranking_bar(df, "strategic_signal", "Señal estratégica"), use_container_width=True)
-        with right:
-            st.plotly_chart(signal_gap_chart(df), use_container_width=True)
-        st.info("La señal estratégica mezcla narrativa institucional, consenso de think tanks y capacidad de multi-alignment.")
+    with tab2:
+        st.plotly_chart(plot_ranking(df), use_container_width=True)
 
-    with tabs[2]:
-        left, right = st.columns([1.2, 1.8])
-        with left:
-            st.plotly_chart(ranking_bar(df, "regulatory_friction", "Fricción regulatoria"), use_container_width=True)
-        with right:
-            st.plotly_chart(matrix_power_access(df), use_container_width=True)
-        st.warning("Esta capa intenta capturar tu punto clave: el acceso real al mercado depende más de fricciones regulatorias que del arancel nominal por sí solo.")
-
-    with tabs[3]:
+    with tab3:
         countries = df["country"].tolist()
-        a, b = st.columns(2)
-        country_a = a.selectbox("País A", countries, index=0)
-        country_b = b.selectbox("País B", countries, index=1)
-        st.plotly_chart(radar_compare(df, country_a, country_b), use_container_width=True)
-        st.dataframe(
-            df[df["country"].isin([country_a, country_b])][[
-                "country", "icg_full", "icg_base", "leverage", "resilience", "autonomy",
-                "strategic_signal", "regulatory_friction", "capital_confirmation", "market_access_viability", "shock_penalty"
-            ]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            country_a = st.selectbox("País A", countries, index=0)
+        with col_b:
+            country_b = st.selectbox("País B", countries, index=1 if len(countries) > 1 else 0)
 
-    with tabs[4]:
-        if not articles:
-            st.info("Activa el overlay de noticias y añade tu NewsAPI key para sumar un shock narrativo/event-driven.")
+        if country_a == country_b:
+            st.warning("Selecciona dos países distintos.")
         else:
-            st.success(f"{len(articles)} artículos procesados.")
-            show = pd.DataFrame([
-                {
-                    "title": a.get("title"),
-                    "source": a.get("source", {}).get("name"),
-                    "publishedAt": a.get("publishedAt"),
-                    "url": a.get("url"),
-                }
-                for a in articles
-            ])
-            st.dataframe(show, use_container_width=True, hide_index=True)
-            st.dataframe(df[["country", "news_shock", "shock_penalty"]].sort_values("news_shock", ascending=False), use_container_width=True, hide_index=True)
+            st.plotly_chart(plot_radar(df, country_a, country_b), use_container_width=True)
 
-    with tabs[5]:
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.markdown(
-            """
-            ### Cómo leer esta v3.2
-            - **Real data**: PIB, reservas y energía vienen del API v2 del Banco Mundial.
-            - **Curated layer**: NTM, SPS/TBT, export controls, industrial policy, señal institucional y capital siguen en CSV curado.
-            - **Por qué híbrido**: hoy no todas estas variables tienen una API oficial limpia, homogénea y abierta con la misma cobertura para un dashboard estable.
-            - **Siguiente salto**: reemplazar partes del CSV con pipelines por fuente: WTO/ePing, OECD docs, G20 communiqués, think tanks y flujos temáticos.
-            """
-        )
+            compare_cols = [
+                "country", "icg_full", "icg_base", "signal_score",
+                "friction_score", "capital_confirmation", "category"
+            ]
+            st.dataframe(
+                df[df["country"].isin([country_a, country_b])][compare_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with tab4:
+        show_cols = [
+            "country", "iso3", "gdp_usd", "reserves_usd", "energy_import_pct",
+            "ntm", "regulation", "export_controls", "industrial_policy",
+            "strategic_signal", "think_tank", "capital_confirmation",
+            "icg_base", "signal_score", "friction_score", "icg_full", "category"
+        ]
+        st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.caption("Si el Banco Mundial falla por timeout, la app usa world_bank_fallback.csv para no romperse.")
 
 
 if __name__ == "__main__":
